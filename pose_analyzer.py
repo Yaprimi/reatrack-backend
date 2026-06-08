@@ -28,6 +28,8 @@ from typing import Optional
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
 
 
@@ -207,24 +209,34 @@ def analyze_pose(
     # MediaPipe очікує RGB, OpenCV читає BGR
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-    # ── MediaPipe Pose (статичний режим для одного кадру) ─────────────────────
-    mp_pose = mp.solutions.pose
-    with mp_pose.Pose(
-        static_image_mode=True,           # один кадр — без відеотреку
-        model_complexity=1,               # 0=lite, 1=full, 2=heavy
-        enable_segmentation=False,        # не потрібна для кутів
-        min_detection_confidence=min_detection_confidence,
-    ) as pose:
-        results = pose.process(image_rgb)
+    # ── MediaPipe Pose — Tasks API (mediapipe >= 0.10.x) ─────────────────────
+    _MODEL_PATH = str(Path(__file__).parent / "pose_landmarker_full.task")
+    if not Path(_MODEL_PATH).exists():
+        return _error_response(
+            f"Файл моделі не знайдено: {_MODEL_PATH}. "
+            "Завантажте його командою:\n"
+            "  curl -L -o pose_landmarker_full.task "
+            "\"https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+            "pose_landmarker_full/float16/latest/pose_landmarker_full.task\""
+        )
 
-    if not results.pose_landmarks:
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=_MODEL_PATH),
+        running_mode=mp_vision.RunningMode.IMAGE,
+        min_pose_detection_confidence=min_detection_confidence,
+    )
+    with mp_vision.PoseLandmarker.create_from_options(options) as landmarker:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        detection_result = landmarker.detect(mp_image)
+
+    if not detection_result.pose_landmarks:
         return _error_response(
             "MediaPipe не виявив жодної точки тіла на зображенні. "
             "Переконайтесь, що людина повністю видима на кадрі "
             "та освітлення достатнє."
         )
 
-    landmarks = results.pose_landmarks.landmark
+    landmarks = detection_result.pose_landmarks[0]  # [0] = перша людина на кадрі
 
     # ── Отримання трьох точок суглоба ────────────────────────────────────────
     name_a, name_b, name_c = JOINT_CONFIGS[joint_name]
@@ -343,13 +355,13 @@ def _draw_and_save(
         cv2.putText(frame, label, (px_pt[0] + 10, px_pt[1] - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
-    # Текстовий оверлей
-    status_txt = f"{'ПОМИЛКА' if has_error else 'OK'}: {measured}\xb0"
+    # Text overlay (ASCII only — cv2.putText does not support Unicode)
+    status_txt = f"{'ERROR' if has_error else 'OK'}: {measured}deg"
     cv2.putText(frame, status_txt, (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.1,
                 err_color if has_error else ok_color, 2, cv2.LINE_AA)
     cv2.putText(frame,
-                f"Еталон: {reference}\xb0  \xb110\xb0",
+                f"Ref: {reference}deg  +-10deg",
                 (20, 76),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (60, 60, 60), 1, cv2.LINE_AA)
 
