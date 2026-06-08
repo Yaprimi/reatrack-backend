@@ -28,7 +28,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt as _bcrypt
 from pydantic import BaseModel
 
 # ── Конфіг ──────────────────────────────────────────────────────────────────
@@ -47,7 +47,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 # ── Connection pool (psycopg2) ───────────────────────────────────────────────
@@ -174,7 +173,7 @@ def register(body: RegisterBody):
             )
 
         uid     = str(uuid.uuid4())
-        pw_hash = pwd_ctx.hash(body.password)
+        pw_hash = _bcrypt.hashpw(body.password.encode(), _bcrypt.gensalt()).decode()
 
         cur.execute(
             """
@@ -204,7 +203,7 @@ def login(body: LoginBody):
         row = cur.fetchone()
         cur.close()
 
-    if not row or not pwd_ctx.verify(body.password, row["password_hash"]):
+    if not row or not _bcrypt.checkpw(body.password.encode(), row["password_hash"].encode()):
         raise HTTPException(status_code=401, detail="Невірний email або пароль.")
 
     return {
