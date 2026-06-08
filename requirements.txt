@@ -1,6 +1,6 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
-asyncpg==0.30.0
+psycopg2-binary==2.9.10
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
 pydantic==2.10.3
