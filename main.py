@@ -11,12 +11,15 @@ Endpoints:
   POST /register      — реєстрація
   POST /login         — вхід
   GET  /me            — поточний користувач (Bearer token)
+  POST /analyze       — аналіз кадру через AI (base64 → MediaPipe)
   POST /sessions      — зберегти сесію (Bearer token)
   GET  /sessions      — список сесій (Bearer token)
   GET  /sessions/stats— агрегована статистика (Bearer token)
 """
 
+import base64
 import os
+import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -31,6 +34,9 @@ from jose import JWTError, jwt
 import bcrypt as _bcrypt
 from pydantic import BaseModel
 
+# AI-модуль (pose_analyzer.py має лежати поруч з main.py)
+from pose_analyzer import analyze_pose, JOINT_CONFIGS
+
 # ── Конфіг ──────────────────────────────────────────────────────────────────
 DATABASE_URL      = os.environ["DATABASE_URL"]
 SECRET_KEY        = os.environ.get("SECRET_KEY", "змініть-у-продакшні")
@@ -38,7 +44,7 @@ ALGORITHM         = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 
 # ── Ініціалізація ────────────────────────────────────────────────────────────
-app = FastAPI(title="ReaTrack API", version="1.0.0")
+app = FastAPI(title="ReaTrack API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -146,6 +152,23 @@ class SessionBody(BaseModel):
     score:         int
 
 
+class AnalyzeBody(BaseModel):
+    """
+    Тіло запиту для POST /analyze.
+
+    Поля:
+      frame           — зображення у форматі base64 (JPEG або PNG).
+                        Може містити data URI prefix: "data:image/jpeg;base64,..."
+      joint           — суглоб для аналізу (напр. "left_elbow", "left_knee")
+      reference_angle — еталонний кут у градусах (напр. 160.0)
+      tolerance       — допустиме відхилення (за замовчуванням ±10°)
+    """
+    frame:           str
+    joint:           str   = "left_elbow"
+    reference_angle: float = 160.0
+    tolerance:       float = 10.0
+
+
 # ── Маршрути ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
@@ -236,6 +259,101 @@ def me(uid: str = Depends(get_current_user_id)):
     }
 
 
+# ── /analyze ─────────────────────────────────────────────────────────────────
+@app.post("/analyze")
+def analyze_frame(body: AnalyzeBody):
+    """
+    Аналізує кадр вправи через MediaPipe.
+
+    Приймає зображення у форматі base64, передає його до pose_analyzer.py,
+    і повертає результат аналізу кута суглоба.
+
+    Приклад запиту:
+        {
+            "frame": "<base64-encoded JPEG>",
+            "joint": "left_knee",
+            "reference_angle": 90.0,
+            "tolerance": 10.0
+        }
+
+    Відповідь (успіх):
+        {
+            "status": "ok",
+            "joint": "left_knee",
+            "measured_angle": 88.5,
+            "reference_angle": 90.0,
+            "deviation": 1.5,
+            "tolerance": 10.0,
+            "is_correct": true,
+            "confidence": 0.94,
+            "message": "Кут left_knee: 88.5° ..."
+        }
+    """
+    # Валідація суглоба
+    if body.joint not in JOINT_CONFIGS:
+        valid = ", ".join(JOINT_CONFIGS.keys())
+        raise HTTPException(
+            status_code=422,
+            detail=f"Невідомий суглоб '{body.joint}'. Доступні: {valid}",
+        )
+
+    # Декодуємо base64 → байти зображення
+    try:
+        raw_b64 = body.frame
+        # Прибираємо data URI prefix якщо є (напр. "data:image/jpeg;base64,...")
+        if "," in raw_b64:
+            raw_b64 = raw_b64.split(",", 1)[1]
+        image_bytes = base64.b64decode(raw_b64)
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Поле 'frame' містить некоректний base64.",
+        )
+
+    # Записуємо у тимчасовий файл (pose_analyzer потребує шляху до файлу)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir="/tmp") as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+
+        result = analyze_pose(
+            image_path=tmp_path,
+            joint_name=body.joint,
+            reference_angle=body.reference_angle,
+            tolerance=body.tolerance,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Помилка AI-модуля: {exc}")
+    finally:
+        # Завжди видаляємо тимчасовий файл
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    # AI повернув помилку (поза не знайдена, поганий кадр тощо)
+    if result.get("status") == "error":
+        return {
+            "status":     "error",
+            "is_correct": False,
+            "message":    result.get("message", "Невідома помилка AI."),
+        }
+
+    # is_error (pose_analyzer) → is_correct (зручніше для мобільного клієнта)
+    return {
+        "status":          "ok",
+        "joint":           result["joint"],
+        "landmarks_used":  result["landmarks_used"],
+        "measured_angle":  result["measured_angle"],
+        "reference_angle": result["reference_angle"],
+        "deviation":       result["deviation"],
+        "tolerance":       result["tolerance"],
+        "is_correct":      not result["is_error"],
+        "confidence":      result["confidence"],
+        "message":         result["message"],
+    }
+
+
+# ── /sessions ─────────────────────────────────────────────────────────────────
 @app.post("/sessions", status_code=201)
 def create_session(body: SessionBody, uid: str = Depends(get_current_user_id)):
     with get_db() as conn:
